@@ -749,5 +749,203 @@ body{
 })();
 </script>
 
+
+
+<!-- QR scanner support for KEEKeR Receive. The existing document-capture mode remains unchanged. -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+(function(){
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('mode') !== 'qr') return;
+
+  var video = document.getElementById('video');
+  var canvas = document.getElementById('canvas');
+  var placeholder = document.getElementById('placeholder');
+  var start = document.getElementById('start');
+  var capture = document.getElementById('capture');
+  var retake = document.getElementById('retake');
+  var done = document.getElementById('done');
+  var cancel = document.getElementById('cancel');
+  var count = document.getElementById('count');
+  var thumbs = document.getElementById('thumbs');
+  var status = document.getElementById('status');
+  var notice = document.getElementById('notice');
+  var title = document.querySelector('.title');
+  var subtitle = title && title.parentElement ? title.parentElement.querySelector('div[style]') : null;
+
+  /* Remove the document-capture click handlers by replacing the buttons. */
+  if (start) start = start.cloneNode(true);
+  if (cancel) cancel = cancel.cloneNode(true);
+  var oldStart = document.getElementById('start');
+  var oldCancel = document.getElementById('cancel');
+  if (oldStart && start) oldStart.parentNode.replaceChild(start, oldStart);
+  if (oldCancel && cancel) oldCancel.parentNode.replaceChild(cancel, oldCancel);
+
+  if (capture) capture.style.display = 'none';
+  if (retake) retake.style.display = 'none';
+  if (done) done.style.display = 'none';
+  if (thumbs) thumbs.style.display = 'none';
+  if (count) count.textContent = 'QR scanner ready';
+  if (title) title.textContent = 'KEEKeR QR Scanner';
+  if (subtitle) subtitle.textContent = 'Scan Transaction QR Code';
+  if (notice) notice.innerHTML = 'Click <strong>START CAMERA</strong>. Your browser may then ask for permission to use the camera. Choose <strong>Allow</strong> to scan the transaction QR code.';
+  if (placeholder) placeholder.innerHTML = '<strong>QR scanner is not active</strong>Start the camera and point it at the KEEKeR transaction QR code.';
+  if (start) start.textContent = 'START CAMERA';
+  if (cancel) cancel.textContent = 'CANCEL';
+
+  var qrStream = null;
+  var scanning = false;
+  var resultSent = false;
+  var animationId = null;
+
+  function setStatus(message,type){
+    if (!status) return;
+    status.className = 'status ' + (type || '');
+    status.textContent = message || '';
+  }
+
+  function stopCamera(){
+    scanning = false;
+    if (animationId) {
+      cancelAnimationFrame(animationId);
+      animationId = null;
+    }
+    if (qrStream) {
+      qrStream.getTracks().forEach(function(track){ track.stop(); });
+      qrStream = null;
+    }
+    if (video) video.srcObject = null;
+  }
+
+  function getReturnOrigin(){
+    var target = '*';
+    try{
+      var o = new URLSearchParams(location.search).get('returnOrigin');
+      if (o && o !== 'null') target = o;
+    }catch(e){}
+    return target;
+  }
+
+  function sendQRResult(text){
+    if (resultSent) return;
+    resultSent = true;
+    stopCamera();
+    setStatus('QR code detected. Returning transaction to KEEKeR...','ok');
+
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({
+        source:'KEEKeR_CAMERA',
+        type:'QR_RESULT',
+        qrToken:String(text || '').trim()
+      }, getReturnOrigin());
+      setTimeout(function(){ window.close(); }, 250);
+    } else {
+      resultSent = false;
+      setStatus('The KEEKeR window is no longer available. Please close this window and try again.','err');
+    }
+  }
+
+  function scanFrame(){
+    if (!scanning || resultSent) return;
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      animationId = requestAnimationFrame(scanFrame);
+      return;
+    }
+
+    var width = video.videoWidth;
+    var height = video.videoHeight;
+    canvas.width = width;
+    canvas.height = height;
+    var ctx = canvas.getContext('2d', {willReadFrequently:true});
+    ctx.drawImage(video,0,0,width,height);
+
+    try{
+      var imageData = ctx.getImageData(0,0,width,height);
+      var code = window.jsQR ? window.jsQR(imageData.data,width,height,{inversionAttempts:'attemptBoth'}) : null;
+      if (code && code.data) {
+        sendQRResult(code.data);
+        return;
+      }
+    }catch(e){
+      console.error(e);
+    }
+
+    animationId = requestAnimationFrame(scanFrame);
+  }
+
+  async function startQRScanner(){
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Camera access is not available in this browser. Please use Chrome or Edge.','err');
+      return;
+    }
+    if (!window.jsQR) {
+      setStatus('QR scanner library is unavailable. Please refresh the camera page and try again.','err');
+      return;
+    }
+
+    stopCamera();
+    resultSent = false;
+    setStatus('Requesting camera permission...');
+    if (start) {
+      start.disabled = true;
+      start.textContent = 'STARTING CAMERA...';
+    }
+
+    try{
+      qrStream = await navigator.mediaDevices.getUserMedia({
+        video:{
+          facingMode:{ideal:'environment'},
+          width:{ideal:1920},
+          height:{ideal:1080}
+        },
+        audio:false
+      });
+
+      video.srcObject = qrStream;
+      video.style.display = 'block';
+      if (placeholder) placeholder.style.display = 'none';
+      if (start) {
+        start.disabled = false;
+        start.textContent = 'RESTART CAMERA';
+      }
+      if (count) count.textContent = 'Scanning for QR code...';
+      setStatus('Camera ready. Point it at the KEEKeR transaction QR code.','ok');
+      scanning = true;
+      animationId = requestAnimationFrame(scanFrame);
+    }catch(e){
+      console.error(e);
+      if (start) {
+        start.disabled = false;
+        start.textContent = 'START CAMERA';
+      }
+      var name = e && e.name ? String(e.name) : '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setStatus('Camera permission was denied. Please allow camera access for this GitHub camera page and try again.','err');
+      } else {
+        setStatus('Unable to start the camera. Please check that your webcam is available and try again.','err');
+      }
+    }
+  }
+
+  function cancelQRScanner(){
+    stopCamera();
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({
+        source:'KEEKeR_CAMERA',
+        type:'CAMERA_CANCEL'
+      }, getReturnOrigin());
+    }
+    setTimeout(function(){ window.close(); }, 100);
+  }
+
+  if (start) start.addEventListener('click',startQRScanner);
+  if (cancel) cancel.addEventListener('click',cancelQRScanner);
+  window.addEventListener('beforeunload',stopCamera);
+
+  /* Automatically request the camera when Receive opens the QR scanner. */
+  setTimeout(startQRScanner,250);
+})();
+</script>
+
 </body>
 </html>
