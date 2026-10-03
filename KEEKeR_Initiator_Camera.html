@@ -773,7 +773,7 @@ body{
   var title = document.querySelector('.title');
   var subtitle = title && title.parentElement ? title.parentElement.querySelector('div[style]') : null;
 
-  /* Remove the document-capture click handlers by replacing the buttons. */
+  /* Replace the document-capture handlers with QR-mode handlers. */
   if (start) start = start.cloneNode(true);
   if (cancel) cancel = cancel.cloneNode(true);
   var oldStart = document.getElementById('start');
@@ -785,11 +785,11 @@ body{
   if (retake) retake.style.display = 'none';
   if (done) done.style.display = 'none';
   if (thumbs) thumbs.style.display = 'none';
-  if (count) count.textContent = 'QR scanner ready';
+  if (count) count.style.display = 'none';
   if (title) title.textContent = 'KEEKeR QR Scanner';
   if (subtitle) subtitle.textContent = 'Scan Transaction QR Code';
-  if (notice) notice.innerHTML = 'Click <strong>START CAMERA</strong>. Your browser may then ask for permission to use the camera. Choose <strong>Allow</strong> to scan the transaction QR code.';
-  if (placeholder) placeholder.innerHTML = '<strong>QR scanner is not active</strong>Start the camera and point it at the KEEKeR transaction QR code.';
+  if (notice) notice.innerHTML = 'Allow camera access when your browser asks. The scanner will start automatically.';
+  if (placeholder) placeholder.innerHTML = '<strong>Camera is starting...</strong>Please allow camera access to scan a KEEKeR transaction QR code.';
   if (start) start.textContent = 'START CAMERA';
   if (cancel) cancel.textContent = 'CANCEL';
 
@@ -797,6 +797,10 @@ body{
   var scanning = false;
   var resultSent = false;
   var animationId = null;
+  var lastScanTime = 0;
+  var scanBusy = false;
+  var scanCanvas = document.createElement('canvas');
+  var scanCtx = scanCanvas.getContext('2d', {willReadFrequently:true});
 
   function setStatus(message,type){
     if (!status) return;
@@ -806,6 +810,7 @@ body{
 
   function stopCamera(){
     scanning = false;
+    scanBusy = false;
     if (animationId) {
       cancelAnimationFrame(animationId);
       animationId = null;
@@ -830,6 +835,7 @@ body{
     if (resultSent) return;
     resultSent = true;
     stopCamera();
+    if (notice) notice.style.display = 'none';
     setStatus('QR code detected. Returning transaction to KEEKeR...','ok');
 
     if (window.opener && !window.opener.closed) {
@@ -841,33 +847,90 @@ body{
       setTimeout(function(){ window.close(); }, 250);
     } else {
       resultSent = false;
-      setStatus('The KEEKeR window is no longer available. Please close this window and try again.','err');
+      setStatus('QR code detected, but the KEEKeR window is no longer available.','err');
     }
   }
 
-  function scanFrame(){
+  function decodeImage(data,width,height){
+    if (!window.jsQR || !data || !width || !height) return null;
+    try{
+      return window.jsQR(data,width,height,{inversionAttempts:'attemptBoth'});
+    }catch(e){
+      return null;
+    }
+  }
+
+  function tryDecodeFrame(){
+    if (!video || !video.videoWidth || !video.videoHeight) return null;
+
+    var sourceWidth = video.videoWidth;
+    var sourceHeight = video.videoHeight;
+    var maxWidth = 1280;
+    var scale = Math.min(1,maxWidth/sourceWidth);
+    var width = Math.max(320,Math.round(sourceWidth*scale));
+    var height = Math.max(240,Math.round(sourceHeight*scale));
+
+    /* First attempt: the complete frame at a practical scanning resolution. */
+    scanCanvas.width = width;
+    scanCanvas.height = height;
+    scanCtx.drawImage(video,0,0,width,height);
+    var imageData = scanCtx.getImageData(0,0,width,height);
+    var code = decodeImage(imageData.data,width,height);
+    if (code && code.data) return code.data;
+
+    /* Second attempt: center crop. This gives jsQR a larger QR region when
+       the user holds a phone/document in the middle of the webcam view. */
+    var cropRatio = 0.72;
+    var cropWidth = Math.round(width*cropRatio);
+    var cropHeight = Math.round(height*cropRatio);
+    var cropX = Math.round((width-cropWidth)/2);
+    var cropY = Math.round((height-cropHeight)/2);
+    var cropCanvas = document.createElement('canvas');
+    cropCanvas.width = cropWidth;
+    cropCanvas.height = cropHeight;
+    var cropCtx = cropCanvas.getContext('2d',{willReadFrequently:true});
+    cropCtx.drawImage(scanCanvas,cropX,cropY,cropWidth,cropHeight,0,0,cropWidth,cropHeight);
+    var cropData = cropCtx.getImageData(0,0,cropWidth,cropHeight);
+    code = decodeImage(cropData.data,cropWidth,cropHeight);
+    if (code && code.data) return code.data;
+
+    /* Third attempt: square center crop, useful for a QR held close to the
+       laptop camera with dark areas around it. */
+    var side = Math.min(width,height);
+    var sx = Math.round((width-side)/2);
+    var sy = Math.round((height-side)/2);
+    var squareCanvas = document.createElement('canvas');
+    squareCanvas.width = side;
+    squareCanvas.height = side;
+    var squareCtx = squareCanvas.getContext('2d',{willReadFrequently:true});
+    squareCtx.drawImage(scanCanvas,sx,sy,side,side,0,0,side,side);
+    var squareData = squareCtx.getImageData(0,0,side,side);
+    code = decodeImage(squareData.data,side,side);
+    return code && code.data ? code.data : null;
+  }
+
+  function scanFrame(timestamp){
     if (!scanning || resultSent) return;
+
     if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
       animationId = requestAnimationFrame(scanFrame);
       return;
     }
 
-    var width = video.videoWidth;
-    var height = video.videoHeight;
-    canvas.width = width;
-    canvas.height = height;
-    var ctx = canvas.getContext('2d', {willReadFrequently:true});
-    ctx.drawImage(video,0,0,width,height);
-
-    try{
-      var imageData = ctx.getImageData(0,0,width,height);
-      var code = window.jsQR ? window.jsQR(imageData.data,width,height,{inversionAttempts:'attemptBoth'}) : null;
-      if (code && code.data) {
-        sendQRResult(code.data);
-        return;
+    /* Limit decoding to about 10 attempts per second so the laptop CPU is not
+       overwhelmed while the webcam continues displaying smoothly. */
+    if (timestamp - lastScanTime >= 100 && !scanBusy) {
+      lastScanTime = timestamp;
+      scanBusy = true;
+      try{
+        var text = tryDecodeFrame();
+        if (text) {
+          sendQRResult(text);
+          return;
+        }
+      }finally{
+        scanBusy = false;
       }
-    }catch(e){
-      console.error(e);
     }
 
     animationId = requestAnimationFrame(scanFrame);
@@ -904,13 +967,14 @@ body{
       video.srcObject = qrStream;
       video.style.display = 'block';
       if (placeholder) placeholder.style.display = 'none';
+      if (notice) notice.style.display = 'none';
       if (start) {
         start.disabled = false;
         start.textContent = 'RESTART CAMERA';
       }
-      if (count) count.textContent = 'Scanning for QR code...';
-      setStatus('Camera ready. Point it at the KEEKeR transaction QR code.','ok');
+      setStatus('Scanning for QR code...','ok');
       scanning = true;
+      lastScanTime = 0;
       animationId = requestAnimationFrame(scanFrame);
     }catch(e){
       console.error(e);
@@ -918,6 +982,7 @@ body{
         start.disabled = false;
         start.textContent = 'START CAMERA';
       }
+      if (notice) notice.style.display = '';
       var name = e && e.name ? String(e.name) : '';
       if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
         setStatus('Camera permission was denied. Please allow camera access for this GitHub camera page and try again.','err');
@@ -942,10 +1007,9 @@ body{
   if (cancel) cancel.addEventListener('click',cancelQRScanner);
   window.addEventListener('beforeunload',stopCamera);
 
-  /* Automatically request the camera when Receive opens the QR scanner. */
+  /* Receive QR mode starts the camera automatically. */
   setTimeout(startQRScanner,250);
 })();
 </script>
-
 </body>
 </html>
