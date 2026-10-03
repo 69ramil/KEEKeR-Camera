@@ -801,6 +801,14 @@ body{
   var scanBusy = false;
   var scanCanvas = document.createElement('canvas');
   var scanCtx = scanCanvas.getContext('2d', {willReadFrequently:true});
+  var nativeDetector = null;
+  if ('BarcodeDetector' in window) {
+    try {
+      nativeDetector = new BarcodeDetector({formats:['qr_code']});
+    } catch(e) {
+      nativeDetector = null;
+    }
+  }
 
   function setStatus(message,type){
     if (!status) return;
@@ -909,7 +917,7 @@ body{
     return code && code.data ? code.data : null;
   }
 
-  function scanFrame(timestamp){
+  async function scanFrame(timestamp){
     if (!scanning || resultSent) return;
 
     if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
@@ -917,12 +925,30 @@ body{
       return;
     }
 
-    /* Limit decoding to about 10 attempts per second so the laptop CPU is not
+    /* Limit decoding to about 7 attempts per second so the laptop CPU is not
        overwhelmed while the webcam continues displaying smoothly. */
-    if (timestamp - lastScanTime >= 100 && !scanBusy) {
+    if (timestamp - lastScanTime >= 140 && !scanBusy) {
       lastScanTime = timestamp;
       scanBusy = true;
       try{
+        /* First use the browser's native QR decoder when available. It is
+           generally more tolerant of QR codes displayed on a phone and of
+           codes containing a center logo. */
+        if (nativeDetector) {
+          try {
+            var nativeResults = await nativeDetector.detect(video);
+            if (nativeResults && nativeResults.length) {
+              var nativeText = nativeResults[0].rawValue;
+              if (nativeText) {
+                sendQRResult(nativeText);
+                return;
+              }
+            }
+          } catch(e) {
+            /* Fall through to jsQR. */
+          }
+        }
+
         var text = tryDecodeFrame();
         if (text) {
           sendQRResult(text);
@@ -972,7 +998,7 @@ body{
         start.disabled = false;
         start.textContent = 'RESTART CAMERA';
       }
-      setStatus('Scanning for QR code...','ok');
+      setStatus(nativeDetector ? 'Scanning for QR code...':'Scanning for QR code...','ok');
       scanning = true;
       lastScanTime = 0;
       animationId = requestAnimationFrame(scanFrame);
